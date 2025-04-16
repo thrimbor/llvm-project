@@ -1773,6 +1773,7 @@ namespace llvm {
     SDValue LowerGET_FPENV_MEM(SDValue Op, SelectionDAG &DAG) const;
     SDValue LowerSET_FPENV_MEM(SDValue Op, SelectionDAG &DAG) const;
     SDValue LowerRESET_FPENV(SDValue Op, SelectionDAG &DAG) const;
+    SDValue LowerDivRem(SDValue Op, SelectionDAG &DAG) const;
     SDValue LowerWin64_i128OP(SDValue Op, SelectionDAG &DAG) const;
     SDValue LowerWin64_FP_TO_INT128(SDValue Op, SelectionDAG &DAG,
                                     SDValue &Chain) const;

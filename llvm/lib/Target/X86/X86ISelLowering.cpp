@@ -59,6 +59,7 @@
 #include "llvm/Support/ErrorHandling.h"
 #include "llvm/Support/KnownBits.h"
 #include "llvm/Support/MathExtras.h"
+#include "llvm/Support/raw_ostream.h"
 #include "llvm/Target/TargetOptions.h"
 #include <algorithm>
 #include <bitset>
@@ -176,6 +177,8 @@ X86TargetLowering::X86TargetLowering(const X86TargetMachine &TM,
       { RTLIB::SREM_I64, "_allrem", CallingConv::X86_StdCall },
       { RTLIB::UREM_I64, "_aullrem", CallingConv::X86_StdCall },
       { RTLIB::MUL_I64, "_allmul", CallingConv::X86_StdCall },
+      { RTLIB::SDIVREM_I64, "_alldvrm", CallingConv::X86_StdCall },
+      { RTLIB::UDIVREM_I64, "_aulldvrm", CallingConv::X86_StdCall },
     };
 
     for (const auto &LC : LibraryCalls) {
@@ -394,7 +397,10 @@ X86TargetLowering::X86TargetLowering(const X86TargetMachine &TM,
     setOperationAction(ISD::UDIV, VT, Expand);
     setOperationAction(ISD::SREM, VT, Expand);
     setOperationAction(ISD::UREM, VT, Expand);
+    setOperationAction(ISD::SDIVREM, VT, Custom);
+    setOperationAction(ISD::UDIVREM, VT, Expand);
   }
+  //setOperationAction(ISD::SDIVREM, MVT::i64, LibCall);
 
   setOperationAction(ISD::BR_JT            , MVT::Other, Expand);
   setOperationAction(ISD::BRCOND           , MVT::Other, Custom);
@@ -1007,6 +1013,7 @@ X86TargetLowering::X86TargetLowering(const X86TargetMachine &TM,
   // (for widening) or expand (for scalarization). Then we will selectively
   // turn on ones that can be effectively codegen'd.
   for (MVT VT : MVT::fixedlen_vector_valuetypes()) {
+      //VT.print(llvm::outs());
     setOperationAction(ISD::SDIV, VT, Expand);
     setOperationAction(ISD::UDIV, VT, Expand);
     setOperationAction(ISD::SREM, VT, Expand);
@@ -29784,6 +29791,88 @@ static SDValue LowerMULO(SDValue Op, const X86Subtarget &Subtarget,
 
   return DAG.getMergeValues({Low, Ovf}, dl);
 }
+#include <iostream>
+SDValue X86TargetLowering::LowerDivRem(SDValue Op, SelectionDAG &DAG) const {
+    EVT VT = Op.getValueType();
+    assert(VT.isInteger() && VT.getSizeInBits() == 64 &&
+           "Unexpected return type for lowering");
+
+    RTLIB::Libcall LC;
+    bool isSigned;
+    switch (Op->getOpcode()) {
+    // clang-format off
+    default: llvm_unreachable("Unexpected request for libcall!");
+    case ISD::SDIVREM:      isSigned = true;  LC = RTLIB::SDIVREM_I64;    break;
+    case ISD::UDIVREM:      isSigned = false; LC = RTLIB::UDIVREM_I64;    break;
+    // clang-format on
+    }
+
+    SDLoc dl(Op);
+    SDValue InChain = DAG.getEntryNode();
+
+    TargetLowering::ArgListTy Args;
+    TargetLowering::ArgListEntry Entry;
+    std::cout << "NumOperands: " << Op->getNumOperands() << std::endl;
+    for (unsigned i = 0, e = Op->getNumOperands(); i != e; ++i) {
+      EVT ArgVT = Op->getOperand(i).getValueType();
+      assert(ArgVT.isInteger() && ArgVT.getSizeInBits() == 64 &&
+             "Unexpected argument type for lowering");
+       //SDValue StackPtr = DAG.CreateStackTemporary(ArgVT, 16); // alignment necessary?
+       //int SPFI = cast<FrameIndexSDNode>(StackPtr.getNode())->getIndex();
+       //MachinePointerInfo MPI = MachinePointerInfo::getFixedStack(DAG.getMachineFunction(), SPFI);
+      //Entry.Node = StackPtr;
+      //InChain = DAG.getStore(InChain, dl, Op->getOperand(i), StackPtr, MPI, Align(16));
+      //Entry.Ty = PointerType::get(*DAG.getContext(), 0);
+      //Entry.IsSExt = false;
+      //Entry.IsZExt = false;
+
+      Type *ArgTy = ArgVT.getTypeForEVT(*DAG.getContext());
+      Entry.Node = Op->getOperand(i);
+      Entry.Ty = ArgTy;
+      Entry.IsSExt = false;
+      Entry.IsZExt = true;
+
+      Args.push_back(Entry);
+    }
+    const DataLayout &DLInfo = DAG.getDataLayout();
+    //unsigned RemainderAlign = DLInfo.getABITypeAlignment(MVT::i64.getTypeForEVT(DLInfo));
+    MachineFunction &MF = DAG.getMachineFunction();
+    int FI = MF.getFrameInfo().CreateStackObject(8, Align(16), false);
+    SDValue RemainderAddr = DAG.getFrameIndex(FI, getPointerTy(DLInfo));
+    Entry.Node = RemainderAddr;
+    Entry.Ty = PointerType::get(*DAG.getContext(), 0);
+    Entry.IsSExt = false;
+    Entry.IsZExt = false;
+    Args.push_back(Entry);
+
+    SDValue Callee = DAG.getExternalSymbol(getLibcallName(LC),
+                                           getPointerTy(DAG.getDataLayout()));
+
+    Type *RetTy = static_cast<EVT>(MVT::i64).getTypeForEVT(*DAG.getContext());
+    //Type *RetTy = StructType::get(Ty, Ty);
+
+    TargetLowering::CallLoweringInfo CLI(DAG);
+    CLI.setDebugLoc(dl)
+        .setChain(InChain)
+        .setLibCallee(
+            getLibcallCallingConv(LC),
+            RetTy, Callee,
+            std::move(Args))
+        .setInRegister()
+        .setSExtResult(isSigned)
+        .setZExtResult(!isSigned);
+
+    std::pair<SDValue, SDValue> CallInfo = LowerCallTo(CLI);
+    CallInfo.first.dump();
+    CallInfo.second.dump();
+
+    SDValue Remainder = DAG.getLoad(VT, dl, InChain, RemainderAddr, MachinePointerInfo::getFixedStack(MF, FI));
+    SDValue ResNode = DAG.getNode(ISD::MERGE_VALUES, dl, DAG.getVTList(VT, VT), CallInfo.first, Remainder);
+    return ResNode;
+
+    return CallInfo.first;
+    //return DAG.getBitcast(VT, CallInfo.first);
+}
 
 SDValue X86TargetLowering::LowerWin64_i128OP(SDValue Op, SelectionDAG &DAG) const {
   assert(Subtarget.isTargetWin64() && "Unexpected target");
@@ -29806,6 +29895,7 @@ SDValue X86TargetLowering::LowerWin64_i128OP(SDValue Op, SelectionDAG &DAG) cons
   case ISD::UDIV:      isSigned = false; LC = RTLIB::UDIV_I128;    break;
   case ISD::SREM:      isSigned = true;  LC = RTLIB::SREM_I128;    break;
   case ISD::UREM:      isSigned = false; LC = RTLIB::UREM_I128;    break;
+  // No SDIVREM_I128?
   // clang-format on
   }
 
@@ -33700,6 +33790,14 @@ void X86TargetLowering::ReplaceNodeResults(SDNode *N,
     if (IsStrict)
       Results.push_back(Res.getValue(1));
     return;
+  }
+  case ISD::SDIVREM:
+  case ISD::UDIVREM: {
+      SDValue Res = LowerDivRem(SDValue(N, 0), DAG);
+      assert(Res.getNumOperands() == 2 && "DivRem need two values");
+      Results.push_back(Res.getValue(0));
+      Results.push_back(Res.getValue(1));
+      return;
   }
   case ISD::SDIV:
   case ISD::UDIV:
